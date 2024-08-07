@@ -1,76 +1,30 @@
 import { APIGatewayProxyHandler } from 'aws-lambda';
-import OpenAI from "openai";
-import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
-import * as dotenv from 'dotenv';
+import { analyzeJobDescription } from './src/analyzer/openaiAnalyzer';
+import { storeResultInDynamoDB } from './src/database/dynamoDbService';
+import { Skill } from './src/types';
+import { cleanJsonString } from './src/utils/jsonUtils';
+import { createResponse } from './src/utils/responseUtils';
+import { STATUS_CODES, ERROR_MESSAGES } from './src/constants/constants';
 
-dotenv.config();
-
-const client = new OpenAI({
-  apiKey: process.env['OPENAI_API_KEY'],
-});
-
-const dynamoDbClient = new DynamoDBClient({ region: 'us-east-1' });
-
-export const handler: APIGatewayProxyHandler = async (event: any) => {
+export const handler: APIGatewayProxyHandler = async (event) => {
   try {
-    console.log('event', event, typeof event);
-    let skills = await analyzeJobDescription(event.body);
-    console.log('skills', skills);
-    const response = {
-      statusCode: 200,
-      body: JSON.stringify(skills),
-    };
-    console.log('response', response);
+    if (!event.body) {
+      return createResponse(STATUS_CODES.BAD_REQUEST, { error: ERROR_MESSAGES.NO_BODY });
+    }
 
-    if (skills?.length) await storeResultInDynamoDB(event.body, skills);
+    const cleanedBody = cleanJsonString(event.body);
+    const { JobDescription } = JSON.parse(cleanedBody);
 
-    return response;
+    if (!JobDescription) {
+      return createResponse(STATUS_CODES.BAD_REQUEST, { error: ERROR_MESSAGES.MISSING_JOB_DESCRIPTION });
+    }
+
+    const skills: Skill[] = await analyzeJobDescription(JobDescription);
+    if (skills.length > 0) await storeResultInDynamoDB(JobDescription, skills);
+
+    return createResponse(STATUS_CODES.OK, skills);
   } catch (error) {
-    console.log('error', error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: `An error occurred + ${error}` }),
-    };
+    console.error('Handler error:', error);
+    return createResponse(STATUS_CODES.INTERNAL_SERVER_ERROR, { error: ERROR_MESSAGES.INTERNAL_ERROR });
   }
 };
-
-async function analyzeJobDescription(description: string) {
-  const prompt = `
-  Analyze the following job description and extract the skills required,
-  categorize their importance (High, Medium, Low), and proficiency 
-  (Advanced, Intermediate, Novice). Provide the response as a JSON array of objects.
-  ${description}
-  `;
-  try {
-    console.log('prompt', prompt);
-    const result = await client.chat.completions.create({
-      messages: [{ role: 'user', content: prompt }],
-      model: 'gpt-4o-mini',
-    }, {timeout: 25 * 1000});
-
-    return result.choices;
-  } catch (error) {
-    throw new Error('Failed to analyze job description');
-  }
-}
-
-
-async function storeResultInDynamoDB(description: string, skills: any[]) {
-  const params = {
-    TableName: process.env.DYNAMODB_TABLE_NAME || 'JobDescriptions',
-    Item: {
-      id: { S: Date.now().toString() },
-      description: { S: description },
-      skills: { S: JSON.stringify(skills) },
-    },
-  };
-
-  const command = new PutItemCommand(params);
-  try {
-    await dynamoDbClient.send(command);
-    console.log("Data stored successfully");
-  } catch (error) {
-    console.error("Error storing data in DynamoDB", error);
-  }
-
-}
